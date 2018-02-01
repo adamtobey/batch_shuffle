@@ -9,6 +9,8 @@ name = "pypi"
 
 numpy = "*"
 pytest = "*"
+pyarrow = "*"
+memory-profiler = "*"
 
 
 [dev-packages]
