@@ -11,6 +11,8 @@ numpy = "*"
 pytest = "*"
 pyarrow = "*"
 memory-profiler = "*"
+redis = "*"
+hiredis = "*"
 
 
 [dev-packages]

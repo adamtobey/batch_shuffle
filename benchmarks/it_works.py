@@ -3,55 +3,46 @@ import pathlib
 import shutil
 import json
 import numpy as np
-import csv
 import pyarrow as pa
 from random import random
 import time
 
-from distributed_regression.write import write_json, BASE_DIR, WRITEAHEAD_DIR, BATCH_DIR, data_path, flush_to_batches, BATCH_SIZE
+from threading import Event
+
+from distributed_regression.write import *
+from distributed_regression.flush import *
 
 TEST_DIR = "test"
 DIR_PATH = os.path.join(BASE_DIR, TEST_DIR)
 
-N_BATCHES = 200
+N_BATCHES = 500
 N_POINTS = N_BATCHES * BATCH_SIZE
 
-def cleanup():
-    shutil.rmtree(data_path(TEST_DIR, WRITEAHEAD_DIR))
-    shutil.rmtree(data_path(TEST_DIR, BATCH_DIR))
-
 def init():
-    pathlib.Path(data_path(TEST_DIR, WRITEAHEAD_DIR)).mkdir(parents=True, exist_ok=True)
-
     batch_path = data_path(TEST_DIR, BATCH_DIR)
     pathlib.Path(batch_path).mkdir(parents=True, exist_ok=True)
 
-    with open(os.path.join(DIR_PATH, 'schema.json'), 'w') as out:
-        json.dump(dict(
-            x='numeric',
-            y='numeric',
-            seq='numeric'
-        ), out)
+    schema = json.dumps(dict(
+        x='numeric',
+        y='numeric',
+        seq='numeric'
+    ))
+    rd.set(rd_user_key(TEST_DIR, SchemaPreprocessor.SCHEMA_KEY), schema)
 
-    with open(os.path.join(DIR_PATH, 'init.json'), 'w') as out:
-        json.dump(dict(
-            n_batches=0
-        ), out)
+    rd.set(rd_user_key(TEST_DIR, BatchWriter.N_BATCH_KEY), 0)
 
 def perform_test():
-    start_gen = time.perf_counter()
+    total_time = 0
     for seq in range(N_POINTS):
         point_json = json.dumps(dict(
             x=random(),
             y=random(),
             seq=seq
         ))
+        start = time.perf_counter()
         write_json(point_json, TEST_DIR)
-    print(f"Generated {N_POINTS} points in {time.perf_counter() - start_gen}s")
-
-    start_flush = time.perf_counter()
-    flush_to_batches(TEST_DIR)
-    print(f"Flushed {N_POINTS} points in {time.perf_counter() - start_flush}s")
+        total_time += time.perf_counter() - start
+    print(f"Wrote {N_POINTS} points in {total_time}s")
 
 def block_to_np(file):
     out = []
@@ -100,8 +91,12 @@ def output_distribution():
     print("Mean seqs: ", mean_seqs)
     print("Correlation: ", np.corrcoef(batches, mean_seqs))
 
-# cleanup()
+rd.flushall()
 init()
+done_signal = Event()
+BatchFlushWorker(rd, done_signal).start()
 perform_test()
-# test_data_corruption()
-output_distribution()
+time.sleep(2)
+done_signal.set()
+test_data_corruption()
+# output_distribution()
