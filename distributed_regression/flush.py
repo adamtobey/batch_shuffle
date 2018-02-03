@@ -1,16 +1,16 @@
 import json
-import os
-import pyarrow as pa
 import numpy as np
-from random import randrange, shuffle, sample
-from .write import * # TODO refactor
-from threading import Thread
 import time
 
-REDIS_FLUSH_KEY = 'flushes_needed'
+from random import shuffle
+from threading import Thread
+
+from .redis import rd, rd_user_key
+from .config import Config
+from .batch_manager import BatchManager
 
 def trigger_flush(name):
-    rd.rpush(REDIS_FLUSH_KEY, name)
+    rd.rpush(Config.redis_keys.flush_queue, name)
 
 # TODO this implementation only allows a single flush worker.
 # To scale, use the message channel only for triggering a flush,
@@ -28,12 +28,13 @@ class BatchFlushWorker(Thread):
 
     def run(self):
         while True:
-            response = self.rd.blpop(REDIS_FLUSH_KEY, 2)
+            response = self.rd.blpop(Config.redis_keys.flush_queue, 2)
             if response:
                 name_to_flush = response[1].decode("utf-8")
-                key_to_flush = wal_redis_key(name_to_flush)
+                key_to_flush = rd_user_key(name_to_flush, Config.redis_keys.wal)
                 self.flush_to_batches(key_to_flush, name_to_flush)
             elif self.done_signal.is_set():
+                # TODO this is dumb
                 print(f"Spent {self.total_time}s in flush")
                 raise RuntimeError("I'm a savage...")
 
@@ -45,8 +46,8 @@ class BatchFlushWorker(Thread):
         # Get the batch and remove the read range atomically
         with rd.pipeline() as pipe:
             pipe.multi()
-            pipe.lrange(redis_key, 0, BATCH_SIZE - 1)
-            pipe.ltrim(redis_key, BATCH_SIZE, -1)
+            pipe.lrange(redis_key, 0, Config.batches.size - 1)
+            pipe.ltrim(redis_key, Config.batches.size, -1)
             batch = pipe.execute()[0]
 
         batch_matrix = processor.json_blobs_to_matrix(batch)
@@ -59,17 +60,14 @@ class SchemaViolationError(RuntimeError):
 
 class SchemaPreprocessor(object):
 
-    # TODO config
-    SCHEMA_KEY = 'schema'
-
     def __init__(self, name):
         self.name = name
-        self.schema = json.loads(rd.get(rd_user_key(self.name, self.SCHEMA_KEY)).decode('utf-8'))
+        self.schema = json.loads(rd.get(rd_user_key(self.name, Config.redis_keys.schema)).decode('utf-8'))
         # TODO this will change
         self.data_dimension = len(self.schema)
 
     def json_blobs_to_matrix(self, json_blobs):
-        out = np.ndarray((BATCH_SIZE, self.data_dimension))
+        out = np.ndarray((Config.batches.size, self.data_dimension))
         for row, json_blob in enumerate(json_blobs):
             obj = json.loads(json_blob)
             for col, (name, type_name) in enumerate(self.schema.items()):
@@ -91,45 +89,22 @@ class SchemaPreprocessor(object):
 
 class BatchWriter(object):
 
-    # TODO config
-    N_BATCH_KEY = 'n_batches'
-
-    N_SHUFFLE_BATCHES = 4
-
     def __init__(self, name):
-        self.name = name
-        self.batch_dir = data_path(name, BATCH_DIR)
-        self.n_batch_key = rd_user_key(self.name, self.N_BATCH_KEY)
-
-    def n_batches(self):
-        # TODO when does this first get set?
-        return int(rd.get(self.n_batch_key).decode('utf-8'))
-
-    def incr_n_batches(self):
-        rd.incr(self.n_batch_key)
-
-    def batch_file_name(self, batch_index):
-        return os.path.join(self.batch_dir, str(batch_index))
-
-    def choose_random_block(self):
-        block_num = randrange(0, self.n_batches())
-        return self.batch_file_name(block_num)
+        self.bm = BatchManager(name)
 
     def write_batch_matrix(self, batch_matrix):
-        n_batches = self.n_batches()
-        if n_batches >= self.N_SHUFFLE_BATCHES:
+        n_batches = self.bm.batch_count()
+        if n_batches >= Config.batches.shuffle_factor:
             self._write_batch_matrix_and_shuffle(batch_matrix)
         elif n_batches > 1:
             self._write_batch_matrix_and_shuffle(batch_matrix, n_batches)
         else:
             np.random.shuffle(batch_matrix)
-            self.serialize_new_batch(batch_matrix)
+            self.bm.serialize_new_batch(batch_matrix)
 
-    def sample_batches_without_replacement(self, sample_batches):
-        batch_nums = sample(range(self.n_batches()), k=sample_batches)
-        return [self.batch_file_name(num) for num in batch_nums]
+    def _write_batch_matrix_and_shuffle(self, batch_matrix, n_other_batches=Config.batches.shuffle_factor):
+        assert Config.batches.size == batch_matrix.shape[0], "This algorithm currently only supports full batches"
 
-    def _write_batch_matrix_and_shuffle(self, batch_matrix, n_other_batches=N_SHUFFLE_BATCHES):
         # 1. Shuffle the incoming batch so that the data points it later
         # shares with other random batches are non-contiguous. The other
         # blocks are shuffled during this algorithm, so they don't need
@@ -139,22 +114,17 @@ class BatchWriter(object):
         # 2. Choose n_shuffle_batches other blocks at random to shuffle
         # with the new one
         shuffle_batch_index = {
-            batch_path: self.deserialize_batch(batch_path)
-            for batch_path in self.sample_batches_without_replacement(n_other_batches)
+            batch_name: self.bm.deserialize_batch(batch_name)
+            for batch_name in self.bm.sample_batches_without_replacement(n_other_batches)
         }
 
         # 3. Interleave all the batches so that each has an equal amount of
         # data from each of the originals. perform shuffle in place.
-        # TODO what about the extra data that doesn't constitute a full block?
         n_batches = n_other_batches + 1
-
-        assert BATCH_SIZE == batch_matrix.shape[0], "This algorithm currently only supports full batches"
-        assert BATCH_SIZE % n_batches == 0, "This algorithm must be slightly modified to support batches that are not evenly divisible by self.n_shuffle_batches + 1 = {n_batches}."
         shuffle_block_size = batch_matrix.shape[0] // n_batches
 
-        temp = np.ndarray((shuffle_block_size, batch_matrix.shape[1]))
-
         all_the_blocks = [batch_matrix, *shuffle_batch_index.values()]
+        temp = np.ndarray((shuffle_block_size, batch_matrix.shape[1]))
 
         # For each offset, each batch will get a block containing
         # block_size / n_batches data points from the block `offset`
@@ -183,37 +153,7 @@ class BatchWriter(object):
             np.random.shuffle(batch)
 
         # 6. Serialize the batches
-        self.serialize_new_batch(batch_matrix)
+        self.bm.serialize_new_batch(batch_matrix)
 
-        for path, batch in shuffle_batch_index.items():
-            self.serialize_batch(batch, path)
-
-    def deserialize_batch(self, path):
-        # TODO this is fucking insane. NP arrays are stored as arrow tensors
-        # and they're deserialized into shared memory. they can be mutable
-        # sometimes. figure out the conditions to make it mutable. this
-        # really should not be a problem. they're never truly shared here, so
-        # they should be able to be mutable.
-        with pa.memory_map(path) as batch_file:
-            immutable_mofo = pa.deserialize(batch_file.read_buffer())
-            nice_array = np.ndarray(immutable_mofo.shape)
-            nice_array[:,:] = immutable_mofo[:,:]
-            return nice_array
-
-    def serialize_new_batch(self, matrix):
-        path = self.batch_file_name(self.n_batches())
-
-        # Must establish the memory mapped file before it can be opened as a
-        # memory map
-        with pa.OSFile(path, 'w') as new_file:
-            new_file.write(pa.serialize(matrix).to_buffer())
-
-        # TODO this counter is never updated from the actual files, so
-        # It had better always be right. Handle io errors properly and maybe
-        # add some conditions when it should actually be measured as opposed to
-        # continually updated.
-        self.incr_n_batches()
-
-    def serialize_batch(self, matrix, path):
-        with pa.memory_map(path, 'w') as batch_file:
-            batch_file.write(pa.serialize(matrix).to_buffer())
+        for batch_name, batch_matrix in shuffle_batch_index.items():
+            self.bm.serialize_batch(batch_matrix, batch_name)
