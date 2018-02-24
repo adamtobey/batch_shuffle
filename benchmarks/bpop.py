@@ -1,4 +1,4 @@
-from distributed_regression.write import rd
+from batch_shuffle.write import rd
 from threading import Thread
 
 N_MESSAGES = 100

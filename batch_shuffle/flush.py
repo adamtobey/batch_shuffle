@@ -3,57 +3,40 @@ import numpy as np
 import time
 
 from random import shuffle
-from threading import Thread
+from dask.distributed import Lock, Reschedule
 
+from .cluster import client
 from .redis import rd, rd_user_key
 from .config import Config
 from .batch_manager import BatchManager
 
 def trigger_flush(name):
-    rd.rpush(Config.redis_keys.flush_queue, name)
+    future = client.submit(_flush_to_batches, rd_user_key(name, Config.redis_keys.wal), name)
 
-# TODO this implementation only allows a single flush worker.
-# To scale, use the message channel only for triggering a flush,
-# and put the flushed key in a queue. All available flush workers
-# then race to read from that queue, but only one will be able to
-# pop the key. If there are multiple keys, then they will execute
-# concurrently this way.
-class BatchFlushWorker(Thread):
+def _flush_to_batches(redis_key, name):
+    lock = Lock(redis_key)
+    # TODO set timeout and handle
+    if lock.acquire(timeout=1):
+        try:
+            processor = SchemaPreprocessor(name)
+            batch_writer = BatchWriter(name)
 
-    def __init__(self, redis_instance, done_signal):
-        super().__init__()
-        self.rd = redis_instance
-        self.done_signal = done_signal
-        self.total_time = 0
+            # Get the batch and remove the read range atomically
+            with rd.pipeline() as pipe:
+                pipe.multi()
+                pipe.lrange(redis_key, 0, Config.batches.size - 1)
+                pipe.ltrim(redis_key, Config.batches.size, -1)
+                batch = pipe.execute()[0]
 
-    def run(self):
-        while True:
-            response = self.rd.blpop(Config.redis_keys.flush_queue, 2)
-            if response:
-                name_to_flush = response[1].decode("utf-8")
-                key_to_flush = rd_user_key(name_to_flush, Config.redis_keys.wal)
-                self.flush_to_batches(key_to_flush, name_to_flush)
-            elif self.done_signal.is_set():
-                # TODO this is dumb
-                print(f"Spent {self.total_time}s in flush")
-                raise RuntimeError("I'm a savage...")
+            batch_matrix = processor.json_blobs_to_matrix(batch)
+            batch_writer.write_batch_matrix(batch_matrix)
+        finally:
+            lock.release()
+    else:
+        raise Reschedule()
 
-    def flush_to_batches(self, redis_key, name):
-        start = time.perf_counter()
-        processor = SchemaPreprocessor(name)
-        batch_writer = BatchWriter(name)
 
-        # Get the batch and remove the read range atomically
-        with rd.pipeline() as pipe:
-            pipe.multi()
-            pipe.lrange(redis_key, 0, Config.batches.size - 1)
-            pipe.ltrim(redis_key, Config.batches.size, -1)
-            batch = pipe.execute()[0]
 
-        batch_matrix = processor.json_blobs_to_matrix(batch)
-        batch_writer.write_batch_matrix(batch_matrix)
-
-        self.total_time += time.perf_counter() - start
 
 class SchemaViolationError(RuntimeError):
     pass

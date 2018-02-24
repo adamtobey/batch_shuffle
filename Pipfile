@@ -13,10 +13,13 @@ pyarrow = "*"
 memory-profiler = "*"
 redis = "*"
 hiredis = "*"
+dask = "*"
+distributed = "*"
 
 
 [dev-packages]
 
+bokeh = "*"
 
 
 [requires]

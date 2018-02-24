@@ -8,11 +8,10 @@ from random import random
 import time
 from threading import Event
 
-from distributed_regression.config import Config
-from distributed_regression.flush import BatchFlushWorker
-from distributed_regression.write import write_json
-from distributed_regression.redis import rd, rd_user_key
-from distributed_regression.batch_manager import BatchManager
+from batch_shuffle.config import Config
+from batch_shuffle.write import write_json
+from batch_shuffle.redis import rd, rd_user_key
+from batch_shuffle.batch_manager import BatchManager
 
 TEST_DIR = "test"
 DIR_PATH = os.path.join(Config.data.path, TEST_DIR)
@@ -82,10 +81,7 @@ def output_distribution():
 
 rd.flushall()
 init()
-done_signal = Event()
-BatchFlushWorker(rd, done_signal).start()
 perform_test()
 time.sleep(2)
-done_signal.set()
 test_data_corruption()
 # output_distribution()

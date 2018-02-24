@@ -17,6 +17,10 @@ class Config(object):
         db=0
     )
 
+    cluster = _params(
+        address='127.0.0.1:52208' # TODO port is non-deterministic
+    )
+
     redis_keys = _params(
         flush_queue='flushes_needed',
         wal='WAL',
